@@ -1,0 +1,18 @@
+services:
+  audio-classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: audio-classifier
+    container_name: audio-classifier
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./config.yml:/app/config.yml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
