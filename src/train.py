@@ -22,8 +22,8 @@ from torch.cuda.amp import GradScaler
 import pandas as pd
 from tqdm import tqdm
 
-from utils.data import AudioClipDataset
-from utils.model import ClipTransformer
+from utils.data import AudioDataset
+from utils.model import AudioTransformer
 from utils.visualization import (
     plot_training_curves,
     plot_confusion_matrix,
@@ -33,26 +33,26 @@ from utils.visualization import (
 class TrainingManager:
     """Manages the training process for the audio classification model."""
 
-    def __init__(self, config_path: str, experiment_name: Optional[str] = None):
+    def __init__(self, config_path: str, experiment_name: Optional[str] = None, 
+                 checkpoint_path: Optional[str] = None, fresh_start: bool = False):
         """
         Initialize training manager.
 
         Args:
             config_path: Path to configuration file
             experiment_name: Optional name for the experiment
+            checkpoint_path: Optional path to specific checkpoint to resume from
+            fresh_start: If True, start fresh regardless of existing checkpoints
         """
         self.setup_logging()
         self.config = self.load_config(config_path)
         self.experiment_name = experiment_name or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.setup_directories()
         self.setup_device()
-        self.metrics = {
-            'train_loss': [],
-            'val_loss': [],
-            'val_acc': [],
-            'best_acc': 0.0
-        }
-        self.checkpoint_manager = CheckpointManager(self.checkpoint_dir)
+        
+        self.checkpoint_path = checkpoint_path
+        self.fresh_start = fresh_start
+        self.metrics = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'best_acc': 0.0}
 
     def setup_logging(self) -> None:
         """Configure logging settings."""
@@ -110,14 +110,14 @@ class TrainingManager:
 
     def prepare_data(self) -> tuple:
         """Prepare training and validation datasets."""
-        train_dataset = AudioClipDataset(
+        train_dataset = AudioDataset(
             data_path=self.config['dataset']['root'],
             split='train',
             config=self.config,
             max_samples=self.config['dataset'].get('max_samples')
         )
 
-        valid_dataset = AudioClipDataset(
+        valid_dataset = AudioDataset(
             data_path=self.config['dataset']['root'],
             split='dev',
             config=self.config
@@ -144,171 +144,91 @@ class TrainingManager:
         return train_loader, valid_loader, train_dataset.label_map
 
     def train(self) -> None:
-        """Main training loop with automatic resuming and backup functionality."""
-        train_loader, valid_loader, label_map = self.prepare_data()
-
-        # Initialize model
-        model = ClipTransformer(num_classes=len(label_map), config=self.config)
-        if self.n_gpu > 1:
-            model = nn.DataParallel(model)
-        model = model.to(self.device)
-
-        # Initialize training components
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(
-            model.parameters(), 
-            lr=float(self.config['training']['lr'])
-        )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            mode='max',
-            patience=3,
-            verbose=True
-        )
-        scaler = GradScaler(enabled=True)
-
-        # Try to load checkpoint
-        start_epoch = 0
-        checkpoint = self.checkpoint_manager.load_latest()
-        if checkpoint:
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            scaler.load_state_dict(checkpoint['scaler'])
-            self.metrics = checkpoint['metrics']
-            start_epoch = checkpoint['epoch'] + 1
-            self.logger.info(f"Resuming training from epoch {start_epoch}")
-
-        # Initialize backup manager
-        backup_dir = self.output_dir / "backups"
-        backup_dir.mkdir(exist_ok=True)
-        backup_manager = PeriodicBackup(backup_dir)
-
-        # Training loop
+        """Main training loop."""
         try:
-            for epoch in range(start_epoch, self.config['training']['epochs']):
-                self.logger.info(f"\nEpoch {epoch+1}/{self.config['training']['epochs']}")
-                
-                # Training phase
-                train_loss = self._train_epoch(
-                    model=model,
-                    train_loader=train_loader,
-                    criterion=criterion,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch
-                )
-                self.metrics['train_loss'].append(train_loss)
+            train_loader, valid_loader, label_map = self.prepare_data()
+            model = AudioTransformer(num_classes=len(label_map), config=self.config)
+            
+            if self.n_gpu > 1:
+                model = nn.DataParallel(model)
+            model = model.to(self.device)
 
-                # Validation phase
-                val_loss, val_acc = self._validate_epoch(
-                    model=model,
-                    valid_loader=valid_loader,
-                    criterion=criterion,
-                    epoch=epoch
-                )
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=float(self.config['training']['lr'])
+            )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', patience=3, verbose=True
+            )
+            criterion = nn.CrossEntropyLoss()
+
+            # Load checkpoint if available
+            start_epoch = 0
+            checkpoint = self.load_checkpoint()
+            if checkpoint:
+                model.load_state_dict(checkpoint['model'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                scheduler.load_state_dict(checkpoint['scheduler'])
+                self.metrics = checkpoint['metrics']
+                start_epoch = checkpoint['epoch'] + 1
+
+            # Training loop
+            for epoch in range(start_epoch, self.config['training']['epochs']):
+                train_loss = self._train_epoch(model, train_loader, criterion, optimizer, epoch)
+                val_loss, val_acc = self._validate_epoch(model, valid_loader, criterion, epoch)
+                
+                # Update metrics
+                self.metrics['train_loss'].append(train_loss)
                 self.metrics['val_loss'].append(val_loss)
                 self.metrics['val_acc'].append(val_acc)
-
-                # Update learning rate
-                scheduler.step(val_acc)
-                current_lr = optimizer.param_groups[0]['lr']
-                self.logger.info(f"Current learning rate: {current_lr:.2e}")
-
-                # Check if this is the best model
-                is_best = val_acc > self.metrics.get('best_acc', 0)
+                
+                # Check for best model
+                is_best = val_acc > self.metrics['best_acc']
                 if is_best:
                     self.metrics['best_acc'] = val_acc
                     self.logger.info(f"New best validation accuracy: {val_acc:.4f}")
 
-                # Save state
+                # Save checkpoint
                 state = {
                     'epoch': epoch,
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
                     'metrics': self.metrics,
                     'label_map': label_map,
                     'config': self.config
                 }
+                self.save_checkpoint(state, is_best)
 
-                # Regular checkpoint save
-                self.checkpoint_manager.save(state, epoch, is_best)
-
-                # Periodic backup
-                backup_manager.backup(state)
-
-                # Update visualizations
-                self._update_visualizations()
-
+                # Update learning rate
+                scheduler.step(val_acc)
+                
                 # Early stopping check
-                if current_lr < self.config['training'].get('min_lr', 1e-6):
+                if optimizer.param_groups[0]['lr'] < self.config['training'].get('min_lr', 1e-6):
                     self.logger.info("Learning rate below minimum threshold. Stopping training.")
                     break
 
         except KeyboardInterrupt:
-            self.logger.info("\nTraining interrupted by user. Saving checkpoint...")
-            state = {
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
-                'metrics': self.metrics,
-                'label_map': label_map,
-                'config': self.config
-            }
-            self.checkpoint_manager.save(state, epoch)
-            self.logger.info("Checkpoint saved. Exiting...")
-            sys.exit(0)
-
-        except Exception as e:
-            self.logger.error(f"Training failed with error: {str(e)}")
-            self.logger.error(traceback.format_exc())
-            raise
-
+            self.logger.info("\nTraining interrupted by user")
         finally:
-            # Save final model state regardless of how we got here
-            self.logger.info("Saving final model state...")
-            final_state = {
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
-                'metrics': self.metrics,
-                'label_map': label_map,
-                'config': self.config
-            }
-            torch.save(final_state, self.output_dir / "final_model.pth")
-            
-            # Create final training report
             self._create_training_report()
 
     def _create_training_report(self):
-        """Create a summary report of the training run."""
+        """Create and log training summary report."""
         report = {
             'experiment_name': self.experiment_name,
             'total_epochs': len(self.metrics['train_loss']),
             'best_validation_accuracy': self.metrics['best_acc'],
-            'final_training_loss': self.metrics['train_loss'][-1],
-            'final_validation_loss': self.metrics['val_loss'][-1],
-            'final_validation_accuracy': self.metrics['val_acc'][-1],
+            'final_training_loss': self.metrics['train_loss'][-1] if self.metrics['train_loss'] else None,
+            'final_validation_loss': self.metrics['val_loss'][-1] if self.metrics['val_loss'] else None,
+            'final_validation_accuracy': self.metrics['val_acc'][-1] if self.metrics['val_acc'] else None,
             'training_completed': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # Save report
-        report_path = self.output_dir / "training_report.json"
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=4)
-
-        self.logger.info("\nTraining Summary:")
         for key, value in report.items():
             self.logger.info(f"{key}: {value}")
 
-
-    def _train_epoch(self, model, train_loader, criterion, optimizer, scaler, epoch):
+    def _train_epoch(self, model, train_loader, criterion, optimizer, epoch):
         """Run one epoch of training."""
         model.train()
         total_loss = 0
@@ -320,20 +240,19 @@ class TrainingManager:
 
                 optimizer.zero_grad()
 
-                with torch.cuda.amp.autocast():
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                loss.backward()
+                optimizer.step()
 
                 total_loss += loss.item()
                 pbar.set_postfix({'loss': loss.item()})
 
         avg_loss = total_loss / len(train_loader)
-        self.metrics['train_loss'].append(avg_loss)
         self.logger.info(f"Epoch {epoch+1} - Training Loss: {avg_loss:.4f}")
+
+        return avg_loss
 
     def _validate_epoch(self, model, valid_loader, criterion, epoch):
         """Run validation for one epoch."""
@@ -362,22 +281,38 @@ class TrainingManager:
 
         return val_loss, val_acc  # Return both values
 
-    def _save_checkpoint(self, model, optimizer, scheduler, scaler, epoch, val_acc):
-        """Save model checkpoint."""
-        if val_acc > self.metrics['best_acc']:
-            self.metrics['best_acc'] = val_acc
-            torch.save(model.state_dict(), self.output_dir / "best_model.pth")
+    def save_checkpoint(self, state: dict, is_best: bool = False) -> None:
+        """Save checkpoint with optional best model copy."""
+        # Save latest checkpoint
+        checkpoint_path = self.checkpoint_dir / f"checkpoint_latest.pth"
+        torch.save(state, checkpoint_path)
 
-        checkpoint = {
-            'epoch': epoch,
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'scaler': scaler.state_dict(),
-            'metrics': self.metrics
-        }
+        # Save best model separately if needed
+        if is_best:
+            best_path = self.output_dir / "best_model.pth"
+            torch.save(state, best_path)
 
-        torch.save(checkpoint, self.checkpoint_dir / f"checkpoint_{epoch}.pth")
+    def load_checkpoint(self) -> Optional[dict]:
+        """Load checkpoint based on initialization parameters."""
+        if self.fresh_start:
+            self.logger.info("Starting fresh training run as requested")
+            return None
+
+        # Try loading specific checkpoint if provided
+        if self.checkpoint_path:
+            if os.path.exists(self.checkpoint_path):
+                self.logger.info(f"Loading specified checkpoint: {self.checkpoint_path}")
+                return torch.load(self.checkpoint_path)
+            else:
+                raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
+
+        # Try loading latest checkpoint from current experiment
+        latest_path = self.checkpoint_dir / "checkpoint_latest.pth"
+        if latest_path.exists():
+            self.logger.info(f"Resuming from latest checkpoint: {latest_path}")
+            return torch.load(latest_path)
+
+        return None
 
     def _update_visualizations(self):
         """Update training visualizations."""
@@ -387,71 +322,21 @@ class TrainingManager:
             save_path=self.visualization_dir / "training_curves.png"
         )
 
-class CheckpointManager:
-    def __init__(self, checkpoint_dir: Path):
-        self.checkpoint_dir = checkpoint_dir
-        self.latest_checkpoint = None
-        self._find_latest_checkpoint()
-
-    def _find_latest_checkpoint(self) -> None:
-        """Find the latest checkpoint in the directory."""
-        checkpoints = list(self.checkpoint_dir.glob("checkpoint_*.pth"))
-        if checkpoints:
-            # Sort by modification time
-            self.latest_checkpoint = max(checkpoints, key=lambda x: x.stat().st_mtime)
-
-    def save(self, state: dict, epoch: int, is_best: bool = False) -> None:
-        """Save checkpoint with automatic cleanup of old checkpoints."""
-        # Save latest checkpoint
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_{epoch}.pth"
-        torch.save(state, checkpoint_path)
-        self.latest_checkpoint = checkpoint_path
-
-        # Save best model separately if needed
-        if is_best:
-            best_path = self.checkpoint_dir.parent / "best_model.pth"
-            torch.save(state['model'], best_path)
-
-        # Cleanup old checkpoints - keep only last 3
-        checkpoints = sorted(self.checkpoint_dir.glob("checkpoint_*.pth"), 
-                           key=lambda x: x.stat().st_mtime)
-        for chk in checkpoints[:-3]:  # Keep last 3 checkpoints
-            chk.unlink()
-
-    def load_latest(self) -> Optional[dict]:
-        """Load the latest checkpoint if it exists."""
-        if self.latest_checkpoint and self.latest_checkpoint.exists():
-            return torch.load(self.latest_checkpoint)
-        return None
-
-class PeriodicBackup:
-    def __init__(self, backup_dir: Path, interval_minutes: int = 30):
-        self.backup_dir = backup_dir
-        self.interval = interval_minutes * 60  # Convert to seconds
-        self.last_backup = time.time()
-
-    def should_backup(self) -> bool:
-        return time.time() - self.last_backup >= self.interval
-
-    def backup(self, state: dict) -> None:
-        if self.should_backup():
-            backup_path = self.backup_dir / f"backup_{int(time.time())}.pth"
-            torch.save(state, backup_path)
-            self.last_backup = time.time()
-
-            # Cleanup old backups - keep only last 5
-            backups = sorted(self.backup_dir.glob("backup_*.pth"), 
-                           key=lambda x: x.stat().st_mtime)
-            for bak in backups[:-5]:
-                bak.unlink()
-
 def main():
     parser = argparse.ArgumentParser(description="Train audio classification model")
     parser.add_argument("--config", required=True, help="Path to configuration file")
-    parser.add_argument("--experiment", help="Experiment name")
+    parser.add_argument("--experiment", help="Experiment name (default: timestamp)")
+    parser.add_argument("--checkpoint", help="Path to specific checkpoint to resume from")
+    parser.add_argument("--fresh", action="store_true", 
+                       help="Start training from scratch, ignore existing checkpoints")
     args = parser.parse_args()
 
-    trainer = TrainingManager(args.config, args.experiment)
+    trainer = TrainingManager(
+        config_path=args.config,
+        experiment_name=args.experiment,
+        checkpoint_path=args.checkpoint,
+        fresh_start=args.fresh
+    )
     trainer.train()
 
 if __name__ == "__main__":

@@ -1,11 +1,10 @@
-from .data import AudioClipDataset
-from .model import ClipTransformer, AudioEmbedder
+from .data import AudioDataset
+from .model import AudioTransformer
 from .visualization import plot_training_curves, plot_confusion_matrix, print_classification_report
 
 __all__ = [
     'AudioClipDataset',
-    'ClipTransformer',
-    'AudioEmbedder',
+    'AudioTransformer',
     'plot_training_curves',
     'plot_confusion_matrix',
     'print_classification_report'

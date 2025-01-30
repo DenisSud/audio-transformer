@@ -1,39 +1,40 @@
 from .data_processor import CommonVoiceProcessor
-from .model import ClipTransformer, AudioEmbedder
 from torch.utils.data import Dataset
 import torch
+from pathlib import Path
 
-class AudioClipDataset(Dataset):
-    def __init__(self,
-                 data_path: str,
-                 split: str,
-                 config: dict,
-                 max_samples: int = None):
+# utils/data.py
+class AudioDataset(Dataset):
+    def __init__(self, data_path, split, config, max_samples=None):
         """
-        Dataset for Common Voice audio clips.
-
-        Args:
-            data_path: Path to data directory
-            split: Dataset split ('train' or 'dev')
-            config: Configuration dictionary
-            max_samples: Maximum number of samples to use
+        Dataset for Common Voice audio clips using preprocessed cache.
         """
         self.config = config
-        self.processor = CommonVoiceProcessor(config)
-        self.embedder = AudioEmbedder(config)
 
-        # Load dataset
-        self.audio_paths, self.labels, self.label_map = \
-            self.processor.prepare_dataset(data_path, split, max_samples)
+        # Load preprocessed data
+        cache_dir = Path(data_path) / 'preprocessed_cache'
+        cache_file = cache_dir / f"{split}_data.npz"
+        if not cache_file.exists():
+            raise FileNotFoundError(
+                f"Preprocessed data not found at {cache_file}. "
+                "Please run preprocess_dataset.py first with command:\n"
+                f"python preprocess_dataset.py --config <config_path>"
+            )
+
+        # Load cached data
+        cached_data = np.load(cache_file)
+        self.audio_data = cached_data['audio']
+        self.labels = cached_data['labels']
+        self.label_map = cached_data['accent_map'].item()
+
+        # Apply max_samples if specified
+        if max_samples and max_samples < len(self.audio_data):
+            indices = np.random.choice(len(self.audio_data), max_samples, replace=False)
+            self.audio_data = self.audio_data[indices]
+            self.labels = self.labels[indices]
 
     def __len__(self):
-        return len(self.audio_paths)
+        return len(self.audio_data)
 
     def __getitem__(self, idx):
-        # Load and process audio
-        audio = self.processor.process_audio(self.audio_paths[idx])
-
-        # Get embeddings
-        embeddings = self.embedder.get_embeddings(audio)
-
-        return embeddings, torch.tensor(self.labels[idx])
+        return torch.FloatTensor(self.audio_data[idx]), torch.tensor(self.labels[idx])

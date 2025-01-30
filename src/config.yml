@@ -4,21 +4,21 @@ dataset:
 
 audio:
   sr: 16000
-  clip_duration: 5.0
+  clip_duration: 3.0
   max_clips: 5
 
 model:
-  embed_dim: 768
-  num_classes: 0 # Will be set automatically
+  embed_dim: 512
+  dim_feedforward: 2048 
+  transformer_layers: 20  # Can go deeper now
   nhead: 8
-  dim_feedforward: 2048
-  dropout: 0.1
-  transformer_layers: 6
+  dropout: 0.1  # Consider increasing to 0.2 for very deep networks
+  num_classes: 0 # Will be set automatically
 
 training:
-  batch_size: 32
+  batch_size: 8
   lr: 1e-4
-  epochs: 20
+  epochs: 100
   device: "cuda"
 
 output:
