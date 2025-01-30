@@ -1,5 +1,5 @@
 dataset:
-  root: "/data/common-voice"
+  root: "/app/data/common-voice"
   max_samples: null # Set to limit dataset size
 
 audio:
@@ -13,12 +13,12 @@ model:
   nhead: 8
   dim_feedforward: 2048
   dropout: 0.1
-  transformer_layers: 4
+  transformer_layers: 6
 
 training:
-  batch_size: 16
-  lr: 0.0001
-  epochs: 100
+  batch_size: 32
+  lr: 1e-4
+  epochs: 20
   device: "cuda"
 
 output:
