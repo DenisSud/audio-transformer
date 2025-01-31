@@ -16,6 +16,9 @@ import logging
 
 # Configuration
 CONFIG = {
+    'data': {
+        'root': '/kaggle/input/common-voice'
+    },
     'audio': {
         'sr': 16000,
         'clip_duration': 3.0,
@@ -26,7 +29,7 @@ CONFIG = {
     'model': {
         'embed_dim': 512,
         'num_heads': 8,
-        'num_layers': 12,
+        'num_layers': 6,
         'dim_feedforward': 2048,
         'dropout': 0.1
     },
@@ -34,81 +37,146 @@ CONFIG = {
         'batch_size': 32,
         'learning_rate': 1e-4,
         'epochs': 30,
-        'max_samples': None  # Set to int to limit dataset size
+        'max_samples': None
     }
 }
 
 class AudioDataset(Dataset):
-    """Dataset for audio classification."""
+    """Dataset for audio classification with optimized preprocessing."""
 
-    def __init__(self, data_path, split='train', max_samples=None):
+    def __init__(self, data_path, split='train', max_samples=None, cache_spectrograms=True):
         self.data_path = Path(data_path)
         self.config = CONFIG['audio']
+        self.cache_spectrograms = cache_spectrograms
 
         # Load metadata
-        df = pd.read_csv(self.data_path / f"{split}.csv")
+        df = pd.read_csv(self.data_path / f"cv-valid-{split}.csv")
+
+        # Filter by votes
+        print(f"Initial samples: {len(df)}")
+        df = df[
+            (df['up_votes'] > 0) &
+            (df['up_votes'] > df['down_votes'])
+        ]
+
+        # Clean the accent column
+        df = df.dropna(subset=['accent'])
+        df['accent'] = df['accent'].astype(str)
+
+        # Filter classes with too few samples
+        class_counts = df['accent'].value_counts()
+        min_samples_per_class = 10
+        valid_classes = class_counts[class_counts >= min_samples_per_class].index
+        df = df[df['accent'].isin(valid_classes)]
+
         if max_samples:
             df = df.sample(n=min(len(df), max_samples))
 
         # Create label mapping
-        self.classes = sorted(df['label'].unique())
+        self.classes = sorted(df['accent'].unique())
         self.label_map = {label: i for i, label in enumerate(self.classes)}
 
-        self.files = df['path'].values
-        self.labels = [self.label_map[label] for label in df['label'].values]
+        # Store file paths and labels
+        self.files = df['filename'].values
+        self.labels = [self.label_map[accent] for accent in df['accent'].values]
+
+        # Initialize mel spectrogram transform
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.config['sr'],
+            n_fft=self.config['n_fft'],
+            hop_length=self.config['hop_length'],
+            n_mels=self.config['n_mels']
+        )
+
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
+
+        # Cache for spectrograms
+        self.spec_cache = {}
+        if cache_spectrograms:
+            print("Pre-computing mel spectrograms...")
+            for idx in tqdm(range(len(self))):
+                self._load_and_process_audio(idx)
+
+        print(f"\nDataset ready with {len(self.files)} samples and {len(self.classes)} classes")
+
+    def _load_and_process_audio(self, idx):
+        if self.cache_spectrograms and idx in self.spec_cache:
+            return self.spec_cache[idx]
+
+        audio_path = self.data_path / "cv-valid-train" / self.files[idx]
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+
+            if sample_rate != self.config['sr']:
+                resampler = torchaudio.transforms.Resample(sample_rate, self.config['sr'])
+                waveform = resampler(waveform)
+
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+            target_length = int(self.config['sr'] * self.config['clip_duration'])
+            if waveform.shape[1] > target_length:
+                waveform = waveform[:, :target_length]
+            else:
+                waveform = torch.nn.functional.pad(
+                    waveform, (0, target_length - waveform.shape[1])
+                )
+
+            mel_spec = self.mel_transform(waveform)
+            mel_spec = self.amplitude_to_db(mel_spec)
+            mel_spec = (mel_spec - mel_spec.mean()) / mel_spec.std()
+
+        except Exception as e:
+            print(f"Error processing {audio_path}: {e}")
+            mel_spec = torch.zeros((self.config['n_mels'],
+                                  int(self.config['sr'] * self.config['clip_duration']
+                                      // self.config['hop_length'])))
+
+        if self.cache_spectrograms:
+            self.spec_cache[idx] = mel_spec
+
+        return mel_spec
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        # Load and process audio
-        audio_path = self.data_path / self.files[idx]
-        audio, sr = librosa.load(audio_path, sr=self.config['sr'])
-
-        # Ensure fixed length
-        target_length = int(self.config['sr'] * self.config['clip_duration'])
-        if len(audio) > target_length:
-            audio = audio[:target_length]
-        else:
-            audio = np.pad(audio, (0, target_length - len(audio)))
-
-        # Convert to mel spectrogram
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio,
-            sr=self.config['sr'],
-            n_mels=self.config['n_mels'],
-            n_fft=self.config['n_fft'],
-            hop_length=self.config['hop_length']
-        )
-
-        # Convert to log scale
-        mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
-
-        return torch.FloatTensor(mel_spec), torch.tensor(self.labels[idx])
+        mel_spec = self._load_and_process_audio(idx)
+        return mel_spec, torch.tensor(self.labels[idx])
 
 class AudioTransformer(nn.Module):
-    """Transformer-based audio classification model."""
-
     def __init__(self, num_classes):
         super().__init__()
 
         self.config = CONFIG['model']
 
-        # Conv layers to process mel spectrograms
+        # Calculate input dimensions
+        self.n_mels = CONFIG['audio']['n_mels']
+        sr = CONFIG['audio']['sr']
+        duration = CONFIG['audio']['clip_duration']
+        hop_length = CONFIG['audio']['hop_length']
+
+        # Calculate the sequence length after mel spectrogram
+        self.time_dim = int(duration * sr / hop_length)
+
+        # Conv layers
         self.conv_layers = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(2, 2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2)
+            nn.MaxPool2d(2, 2)
         )
 
-        # Calculate sequence length after convolutions
-        self.seq_len = CONFIG['audio']['clip_duration'] * CONFIG['audio']['sr'] // \
-                      CONFIG['audio']['hop_length'] // 4  # After two max pools
+        # Calculate dimensions after conv layers
+        self.freq_dim = self.n_mels // 4
+        self.time_dim = self.time_dim // 4
+
+        # Project to embedding dimension
+        self.projection = nn.Linear(64 * self.freq_dim, self.config['embed_dim'])
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -124,7 +192,7 @@ class AudioTransformer(nn.Module):
             num_layers=self.config['num_layers']
         )
 
-        # Final classification head
+        # Classification head
         self.classifier = nn.Sequential(
             nn.Linear(self.config['embed_dim'], self.config['embed_dim'] // 2),
             nn.ReLU(),
@@ -133,34 +201,28 @@ class AudioTransformer(nn.Module):
         )
 
     def forward(self, x):
-        # Add channel dimension for conv layers
         x = x.unsqueeze(1)
-
-        # Process through conv layers
         x = self.conv_layers(x)
 
-        # Reshape for transformer
         batch_size = x.size(0)
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(batch_size, -1, self.config['embed_dim'])
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.view(batch_size, self.time_dim, 64 * self.freq_dim)
 
-        # Transformer processing
+        x = self.projection(x)
         x = self.transformer(x)
-
-        # Global average pooling
         x = x.mean(dim=1)
-
-        # Classification
         x = self.classifier(x)
 
         return x
 
 def train_epoch(model, loader, criterion, optimizer, device):
-    """Train for one epoch."""
     model.train()
     total_loss = 0
+    correct = 0
+    total = 0
 
-    for inputs, targets in tqdm(loader, desc="Training"):
+    pbar = tqdm(loader, desc="Training")
+    for inputs, targets in pbar:
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
@@ -172,10 +234,18 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
         total_loss += loss.item()
 
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+
+        pbar.set_postfix({
+            'loss': f'{total_loss/len(pbar):.3f}',
+            'acc': f'{100.*correct/total:.2f}%'
+        })
+
     return total_loss / len(loader)
 
 def evaluate(model, loader, criterion, device):
-    """Evaluate model."""
     model.eval()
     total_loss = 0
     correct = 0
@@ -195,7 +265,6 @@ def evaluate(model, loader, criterion, device):
     return total_loss / len(loader), correct / total
 
 def plot_metrics(train_losses, val_losses, val_accs):
-    """Plot training metrics."""
     plt.figure(figsize=(12, 4))
 
     plt.subplot(1, 2, 1)
@@ -214,48 +283,38 @@ def plot_metrics(train_losses, val_losses, val_accs):
     plt.tight_layout()
     plt.show()
 
-def train_model(data_path, model=None):
-    """Main training function."""
-    # Setup
+def train_model(data_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Data loaders
-    train_dataset = AudioDataset(
-        data_path=data_path,
-        split='train',
-        max_samples=CONFIG['training']['max_samples']
-    )
-
-    valid_dataset = AudioDataset(
-        data_path=data_path,
-        split='valid'
-    )
+    # Create datasets with caching
+    train_dataset = AudioDataset(data_path, split='train', cache_spectrograms=True)
+    valid_dataset = AudioDataset(data_path, split='dev', cache_spectrograms=True)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=CONFIG['training']['batch_size'],
-        shuffle=True
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
     )
 
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=CONFIG['training']['batch_size']
+        batch_size=CONFIG['training']['batch_size'],
+        num_workers=4,
+        pin_memory=True
     )
 
-    # Model
-    if model is None:
-        model = AudioTransformer(num_classes=len(train_dataset.classes))
+    model = AudioTransformer(num_classes=len(train_dataset.classes))
     model = model.to(device)
 
-    # Training setup
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=CONFIG['training']['learning_rate']
     )
 
-    # Training loop
     train_losses = []
     val_losses = []
     val_accs = []
